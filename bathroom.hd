@@ -1,0 +1,1336 @@
+#include "asr.h"
+extern "C"{ void * __dso_handle = 0 ;}
+#include "setup.h"
+#include "myLib/asr_event.h"
+#include "HardwareSerial.h"
+#include <string.h>
+
+//#define DEBUG
+
+#define PIN_RESET	6
+#define PIN_LED		4
+#define UART_CMD_MAX_LENGTH	64
+
+#define ARRAY_SIZE(x)	(sizeof(x)/sizeof(x[0]))
+
+typedef struct{
+	int min;
+	int max;
+	int current;
+	int indoor;
+	String weather;
+	String weather2;
+}weather_t;
+
+uint32_t snid;
+bool Debug = 0;
+bool Ready = 0;
+bool Enable = 1;
+bool MCUOnline = 0;
+bool light_exist = 0;
+bool light_online = 1;
+bool speaker_exist = 0;
+bool speaker_online = 1;
+weather_t today = {
+	.min = -300,
+	.max = -300,
+	.current = -300,
+	.indoor = -300,
+	.weather = "",
+	.weather2 = "",
+};
+weather_t tomorrow = {
+	.min = -300,
+	.max = -300,
+	.current = -300,
+	.indoor = -300,
+	.weather = "",
+	.weather2 = "",
+};
+String uart_cmd = "";
+
+uint8_t ASR_volume = 4;
+  #define ASRPRO_VOLUME_MAX   7
+  #define ASRPRO_VOLUME_MIN   1
+uint32_t timer_count = 0;
+  #define TIMER_PERIOD        200     /*micro Second*/
+  #define PING_PERIOD_COUNT   0xff    /*Count of TIMER_PERIOD*/
+uint16_t ping_count = 0;
+  #define PING_LOST_CONNECT   4
+  #define PING_RESET_MCU      ((30*60*1000)/(TIMER_PERIOD*PING_PERIOD_COUNT))
+
+static
+void print_env(){
+      Serial.print("Envs:");
+      Serial.print("\tDebug:");
+      Serial.print(Debug);
+      Serial.print("\r\n\tReady:");
+      Serial.print(Ready);
+      Serial.print("\r\n\tEnable:");
+      Serial.print(Enable);
+      Serial.print("\r\n\tMCUOnline:");
+      Serial.print(MCUOnline);
+      Serial.print("\r\n\tlight_exist:");
+      Serial.print(light_exist);
+      Serial.print("\r\n\tlight_online:");
+      Serial.print(light_online);
+      Serial.print("\r\n\tspeaker_exist:");
+      Serial.print(speaker_exist);
+      Serial.print("\r\n\tspeaker_online:");
+      Serial.print(speaker_online);
+      Serial.print("\r\n\tASR_volume:");
+      Serial.print(ASR_volume);
+      Serial.print("\r\n\tToday weather:");
+      Serial.print(today.weather);
+      Serial.print("--");
+      Serial.print(today.weather2);
+      Serial.print(", curr temp: ");
+      Serial.print(today.current);
+      Serial.print(", min:");
+      Serial.print(today.min);
+      Serial.print(", max:");
+      Serial.print(today.max);
+      Serial.print(", indoor: ");
+      Serial.print(today.indoor);
+      Serial.print("\r\n\tTomorrow weather:");
+      Serial.print(tomorrow.weather);
+      Serial.print("--");
+      Serial.print(tomorrow.weather2);
+      Serial.print(", curr temp: ");
+      Serial.print(tomorrow.current);
+      Serial.print(", min:");
+      Serial.print(tomorrow.min);
+      Serial.print(", max:");
+      Serial.print(tomorrow.max);
+      Serial.print(", indoor:");
+      Serial.print(tomorrow.indoor);
+      Serial.print("\r\n\tping_count:");
+      Serial.print(ping_count);
+      Serial.print("\r\n\ttimer_count:");
+      Serial.print(timer_count);
+      Serial.print("\r\n\tsnid:");
+      Serial.print(snid);
+}
+#ifdef DEBUG
+#include "asrpro_system.h"
+extern "C" {
+	struct ring_buffer {
+		unsigned char buffer[250];
+		int head;
+		int tail;
+	};
+	extern ring_buffer rx_buffer0;
+}
+static inline
+void print_uart(){
+  int i;
+
+	Serial.print("UARTFlag UARTMaskInt UARTMIS UARTRdDR :");
+	Serial.print(UART0->UARTFlag, 16);
+	Serial.print(' ');
+  	Serial.print(UART0->UARTMaskInt, 16);
+	Serial.print(' ');
+	Serial.print(UART0->UARTMIS, 16);
+	Serial.print(' ');
+	Serial.print(UART0->UARTRdDR, 16);
+	Serial.print("\r\n");
+  
+	//uart0_get_info(&buffer, &size, &head, &tail);
+	Serial.print("Buffer info: ");
+	Serial.print((long)&rx_buffer0, 16);
+	 Serial.print(' ');
+ 	 Serial.print(rx_buffer0.head, 16);
+ 	 Serial.print(' ');
+	Serial.print(rx_buffer0.tail, 16);
+	for (i=0;i<250;++i)
+	{
+		if (0 == i%10)
+			Serial.print("\r\n");
+		Serial.print(rx_buffer0.buffer[i], 16);
+		Serial.print(" ");
+	}
+ 	Serial.print("\r\n");
+}
+
+static inline
+void print_cmd(){
+      Serial.print("\r\nUARTCMD buffer:");
+      long addr = (long)uart_cmd.c_str();
+      Serial.print(addr, 16);
+      Serial.print("\r\nUARTCMD len:");
+      Serial.print(uart_cmd.length());
+      Serial.print("\r\nUARTCMD:");
+      Serial.print(uart_cmd);
+}
+#endif //DEBUG
+
+void asr_process(uint16_t id2);
+void fan_process(uint16_t id2);
+void reset_process(uint16_t id2);
+void light_process(uint16_t id2);
+void speaker_process(uint16_t id2);
+void weather_process(uint16_t id2);
+void uart_cmd_process(void);
+bool uart_recv();
+void app_uart_recv();
+
+static
+void ASR_volume_info_generator(String & info)
+{
+	info += "ASRVolume:" + String(ASR_volume);
+}
+
+
+//{speak:橙子-甜美客服,vol:10,speed:10,platform:haohaodada} 
+//{playid:10001,voice:您好，语音助手小蜜蜂准备好了}
+//{ID:0,keyword:"唤醒词",ASR:"小蜜蜂",ASRTO:"您好"}
+
+//{ID:1,keyword:"命令词",ASR:"打开语音识别",ASRTO:"打开语音识别"}
+//{ID:2,keyword:"命令词",ASR:"开始语音识别",ASRTO:""}
+#define ID_ASR_Enable		1
+#define SR_ASR_Enable		2
+
+//{ID:3,keyword:"命令词",ASR:"关闭语音识别",ASRTO:"关闭语音识别"}
+//{ID:4,keyword:"命令词",ASR:"停止语音识别",ASRTO:""}
+#define ID_ASR_Disable		3
+#define SR_ASR_Disable		4
+
+#define SR_ASR_MAX		9
+#define SNID_IS_ENABLE_ID(id)	((id) <= SR_ASR_MAX)
+
+/*ID 250--252 are reserved as ASRPro volume control*/
+//{ID:250,keyword:"命令词",ASR:"最大喇叭音量",ASRTO:"最大喇叭音量"}
+#define ID_ASRVolumeMax		250
+#define SR_ASR_volumeMax	250
+//{ID:251,keyword:"命令词",ASR:"中等喇叭音量",ASRTO:"中等喇叭音量"}
+#define ID_ASRVolumeMiddle	251
+#define SR_ASR_volumeMiddle	251
+//{ID:252,keyword:"命令词",ASR:"最低喇叭音量",ASRTO:"最低喇叭音量"}
+#define ID_ASRVolumeMin		252
+#define SR_ASR_volumeMin	252
+
+#define SR_LOCAL_MIN		10
+//{ID:10,keyword:"命令词",ASR:"打开调试模式",ASRTO:"打开调试模式"}
+#define ID_ASR_DebugOn		10
+#define SR_ASR_DebugOn		10
+//{ID:11,keyword:"命令词",ASR:"关闭调试模式",ASRTO:"关闭调试模式"}
+#define ID_ASR_DebugOff		11
+#define SR_ASR_DebugOff		11
+//{ID:12,keyword:"命令词",ASR:"重启主控",ASRTO:"重启主控"}
+#define ID_ResetMCU		12
+#define SR_MAIN_ResetMCU	12
+//{ID:20,keyword:"命令词",ASR:"提高喇叭音量",ASRTO:"提高喇叭音量"}
+//{ID:21,keyword:"命令词",ASR:"增加喇叭音量",ASRTO:""}
+//{ID:22,keyword:"命令词",ASR:"调大喇叭音量",ASRTO:""}
+#define ID_ASRVolumeTurnUp	20
+#define SR_ASR_volumeTurnUp	29
+//{ID:30,keyword:"命令词",ASR:"降低喇叭音量",ASRTO:"降低喇叭音量"}
+//{ID:31,keyword:"命令词",ASR:"调低喇叭音量",ASRTO:""}
+//{ID:32,keyword:"命令词",ASR:"调小喇叭音量",ASRTO:""}
+//{ID:33,keyword:"命令词",ASR:"减小喇叭音量",ASRTO:""}
+#define ID_ASRVolumeTurnDown	30
+#define SR_ASR_volumeTurnDown	39
+
+#define SR_LOCAL_MAX		49
+#define SNID_IS_LOCAL_ID(id)	(((id)>=SR_LOCAL_MIN && ((id)<=SR_LOCAL_MAX)) || (((id)>=SR_ASR_volumeMax) && ((id)<=SR_ASR_volumeMin)))
+
+#define SR_RESET_MIN		50
+//{ID:50,keyword:"命令词",ASR:"重启灯光",ASRTO:"重启灯光"} 
+#define ID_ResetLight		50
+#define SR_RESET_Light		59
+//{ID:60,keyword:"命令词",ASR:"重启传感器",ASRTO:"重启传感器"} 
+#define ID_ResetSensor		60
+#define SR_RESET_Sensor		69
+#define SR_RESET_MAX		79
+#define SNID_IS_RESET_ID(id)	(((id) >= SR_RESET_MIN) && ((id) <= SR_RESET_MAX))
+
+#define SR_NUMBER_MIN	84
+//{ID:84,keyword:"命令词",ASR:"条耍改",ASRTO:"零"}
+//{ID:85,keyword:"命令词",ASR:"官接思",ASRTO:"一"}
+//{ID:86,keyword:"命令词",ASR:"痛官松",ASRTO:"二"}
+//{ID:87,keyword:"命令词",ASR:"削丝误",ASRTO:"三"}
+//{ID:88,keyword:"命令词",ASR:"景粮载",ASRTO:"四"}
+//{ID:89,keyword:"命令词",ASR:"博菌避",ASRTO:"五"}
+//{ID:90,keyword:"命令词",ASR:"裁纯碉",ASRTO:"六"}
+//{ID:91,keyword:"命令词",ASR:"插趣悟",ASRTO:"七"}
+//{ID:92,keyword:"命令词",ASR:"辞暖慌",ASRTO:"八"}
+//{ID:93,keyword:"命令词",ASR:"纵猛淡",ASRTO:"九"}
+//{ID:94,keyword:"命令词",ASR:"锦耗暂",ASRTO:"十"}
+//{ID:95,keyword:"命令词",ASR:"燃智截",ASRTO:"百"}
+//{ID:96,keyword:"命令词",ASR:"佛驻延",ASRTO:"千"}
+//{ID:97,keyword:"命令词",ASR:"隔枪绍",ASRTO:"万"}
+//{ID:98,keyword:"命令词",ASR:"惨愤昂",ASRTO:"亿"}
+//{ID:99,keyword:"命令词",ASR:"丙迈扯",ASRTO:"负"}
+//{ID:100,keyword:"命令词",ASR:"铸猜隆",ASRTO:"点"}
+#define SR_NUMBER_MAX	100
+#define SNID_IS_NUMBER(id)	(((id)>=SR_NUMBER_MIN) && ((id) <= SR_NUMBER_MAX))
+
+
+#define SR_FAN_MIN		105
+//{ID:105,keyword:"命令词",ASR:"打开风扇",ASRTO:"打开排气扇"}
+//{ID:106,keyword:"命令词",ASR:"打开排气扇",ASRTO:""}
+#define ID_FanTurnOn		105
+#define SR_FAN_TurnOn		109
+//{ID:110,keyword:"命令词",ASR:"关闭风扇",ASRTO:"关闭排气扇"}
+//{ID:111,keyword:"命令词",ASR:"关闭排气扇",ASRTO:""} 
+#define ID_FanTurnOff		110
+#define SR_FAN_TurnOff		119
+#define SR_FAN_MAX		119
+#define SNID_IS_FAN_ID(id)	((id)>=SR_FAN_MIN && ((id)<=SR_FAN_MAX))
+
+#define SR_LIGHT_MIN		200
+//{ID:200,keyword:"命令词",ASR:"开灯",ASRTO:"打开浴室灯"}
+//{ID:201,keyword:"命令词",ASR:"打开灯光",ASRTO:""}
+//{ID:202,keyword:"命令词",ASR:"打开浴室灯",ASRTO:""}
+#define ID_LightTurnOn		200
+#define SR_LIGHT_TurnOn		209
+//{ID:210,keyword:"命令词",ASR:"关灯",ASRTO:"关闭浴室灯"}
+//{ID:211,keyword:"命令词",ASR:"关闭灯光",ASRTO:""}
+//{ID:212,keyword:"命令词",ASR:"关闭浴室灯",ASRTO:""} 
+#define ID_LightTurnOff		210
+#define SR_LIGHT_TurnOff	219
+//{ID:220,keyword:"命令词",ASR:"太暗了",ASRTO:"提高亮度"} 
+//{ID:221,keyword:"命令词",ASR:"调亮灯光",ASRTO:""}
+//{ID:222,keyword:"命令词",ASR:"提高亮度",ASRTO:""}
+//{ID:223,keyword:"命令词",ASR:"增高亮度",ASRTO:""}
+//{ID:224,keyword:"命令词",ASR:"增加亮度",ASRTO:""}
+#define ID_BrightnessTurnUp		220
+#define SR_LIGHT_BrightnessTurnUp	229
+//{ID:230,keyword:"命令词",ASR:"太亮了",ASRTO:"降低亮度"} 
+//{ID:231,keyword:"命令词",ASR:"调暗灯光",ASRTO:""}
+//{ID:232,keyword:"命令词",ASR:"降低亮度",ASRTO:""}
+//{ID:233,keyword:"命令词",ASR:"减小亮度",ASRTO:""}
+#define ID_BrightnessTurnDown		230
+#define SR_LIGHT_BrightnessTurnDown	239
+//{ID:240,keyword:"命令词",ASR:"最高亮度",ASRTO:"最高亮度"}
+//{ID:241,keyword:"命令词",ASR:"亮度最高",ASRTO:""}
+#define ID_BrightnessMax		240
+#define SR_LIGHT_BrightnessMax		249
+/*ID 250--252 are reserved as ASRPro volume control*/
+//{ID:260,keyword:"命令词",ASR:"中等亮度",ASRTO:"中等亮度"}
+//{ID:261,keyword:"命令词",ASR:"亮度中等",ASRTO:""}
+#define ID_BrightnessMiddle		260
+#define SR_LIGHT_BrightnessMiddle	269
+//{ID:270,keyword:"命令词",ASR:"最低亮度",ASRTO:"最低亮度"}
+//{ID:271,keyword:"命令词",ASR:"亮度最低",ASRTO:""}
+#define ID_BrightnessMin		270
+#define SR_LIGHT_BrightnessMin		279
+#define SR_LIGHT_MAX			299
+#define SNID_IS_LIGHT_ID(id)	((id)>=SR_LIGHT_MIN && ((id)<=SR_LIGHT_MAX))
+
+#define SR_SPEAKER_MIN			300
+//{ID:300,keyword:"命令词",ASR:"打开音箱",ASRTO:"打开音箱"}
+#define ID_SpeakerTurnOn		300
+#define SR_SPEAKER_TurnOn		300
+//{ID:301,keyword:"命令词",ASR:"关闭音箱",ASRTO:"关闭音箱"}
+#define ID_SpeakerTurnOff		301
+#define SR_SPEAKER_TurnOff		301
+//{ID:302,keyword:"命令词",ASR:"播放",ASRTO:"播放音乐"}
+#define ID_SpeakerPlay			302
+#define SR_SPEAKER_Play			302
+//{ID:303,keyword:"命令词",ASR:"停止",ASRTO:"停止播放"}
+#define ID_SpeakerStop			303
+#define SR_SPEAKER_Stop			303
+//{ID:304,keyword:"命令词",ASR:"暂停",ASRTO:"暂停播放"}
+#define ID_SpeakerPause			304
+#define SR_SPEAKER_Pause		304
+//{ID:305,keyword:"命令词",ASR:"上一首",ASRTO:"上一首"}
+#define ID_SpeakerPrevious		305 
+#define SR_SPEAKER_Previous		305
+//{ID:306,keyword:"命令词",ASR:"下一首",ASRTO:"下一首"} 
+#define ID_SpeakerNext			306
+#define SR_SPEAKER_Next			306
+
+//{ID:310,keyword:"命令词",ASR:"提高音量",ASRTO:"提高音量"}
+//{ID:311,keyword:"命令词",ASR:"增加音量",ASRTO:""}
+//{ID:312,keyword:"命令词",ASR:"调大音量",ASRTO:""}
+#define ID_VolumeTurnUp			310
+#define SR_SPEAKER_VolumeTurnUp		319
+//{ID:320,keyword:"命令词",ASR:"降低音量",ASRTO:"降低音量"}
+//{ID:321,keyword:"命令词",ASR:"调低音量",ASRTO:""}
+//{ID:322,keyword:"命令词",ASR:"调小音量",ASRTO:""}
+//{ID:323,keyword:"命令词",ASR:"减小音量",ASRTO:""}
+#define ID_VolumeTurnDown		320
+#define SR_SPEAKER_VolumeTurnDown	329
+//{ID:330,keyword:"命令词",ASR:"最大音量",ASRTO:"最大音量"}
+//{ID:331,keyword:"命令词",ASR:"最高音量",ASRTO:""}
+#define ID_VolumeMax			330
+#define SR_SPEAKER_VolumeMax		339
+//{ID:340,keyword:"命令词",ASR:"中间音量",ASRTO:"中等音量"}
+//{ID:341,keyword:"命令词",ASR:"中等音量",ASRTO:""}
+#define ID_VolumeMiddle			340
+#define SR_SPEAKER_VolumeMiddle		349
+//{ID:350,keyword:"命令词",ASR:"最小音量",ASRTO:"最低音量"}
+//{ID:351,keyword:"命令词",ASR:"最低音量",ASRTO:""}
+#define ID_VolumeMin			350
+#define SR_SPEAKER_VolumeMin		359
+#define SR_SPEAKER_MAX			399
+#define SNID_IS_SPEAKER_ID(id)	((id)>=SR_SPEAKER_MIN && ((id)<=SR_SPEAKER_MAX))
+
+#define SR_WEATHER_MIN		400
+//{ID:400,keyword:"命令词",ASR:"今天气温",ASRTO:"今天天气"}
+#define ID_WEATHER_TODAY	400
+//{ID:401,keyword:"命令词",ASR:"今天温度",ASRTO:""}
+//{ID:402,keyword:"命令词",ASR:"今天天气",ASRTO:""}
+#define SR_WEATHER_TODAY	403
+//{ID:403,keyword:"命令词",ASR:"明天气温",ASRTO:"明天天气"}
+#define ID_WEATHER_TOMORROW	403
+//{ID:404,keyword:"命令词",ASR:"明天温度",ASRTO:""}
+//{ID:405,keyword:"命令词",ASR:"明天天气",ASRTO:""}
+#define SR_WEATHER_TOMORROW	405
+#define SR_WEATHER_MAX		405
+//{ID:406,keyword:"命令词",ASR:"耍接官",ASRTO:"晴"}
+#define ID_WEATHER_SUNNY	406
+//{ID:407,keyword:"命令词",ASR:"接耍官",ASRTO:"多云"}
+#define ID_WEATHER_PARTYCLOUDY	407
+//{ID:408,keyword:"命令词",ASR:"官耍接",ASRTO:"阴"}
+#define ID_WEATHER_CLOUDY	408
+//{ID:409,keyword:"命令词",ASR:"丝耍接",ASRTO:"雨"}
+#define ID_WEATHER_RAINY	409
+//{ID:410,keyword:"命令词",ASR:"粮耍接",ASRTO:"雪"}
+#define ID_WEATHER_SNOWY	410
+//{ID:411,keyword:"命令词",ASR:"菌耍接",ASRTO:"转"}
+#define ID_WEATHER_CHANGETO	411
+//{ID:412,keyword:"命令词",ASR:"纯耍接",ASRTO:"气温"}
+#define ID_WEATHER_TEMPERATURE	412
+//{ID:413,keyword:"命令词",ASR:"趣耍接",ASRTO:"度"}
+#define ID_WEATHER_DEGREE	413
+//{ID:414,keyword:"命令词",ASR:"暖耍接",ASRTO:"到"}
+#define ID_WEATHER_TO		414
+//{ID:415,keyword:"命令词",ASR:"猛耍接",ASRTO:"当前室外"}
+#define ID_WEATHER_OUTDOOR	415
+//{ID:416,keyword:"命令词",ASR:"耍官接",ASRTO:"当前室内"}
+#define ID_WEATHER_INDOOR	416
+//{ID:417,keyword:"命令词",ASR:"接官耍",ASRTO:"天气数据错误"}
+#define ID_WEATHER_ERROR	417
+#define SNID_IS_WEATHER_ID(id)	((id)>=SR_WEATHER_MIN && (id)<=SR_WEATHER_MAX)
+
+/*ID:512,keyword:"命令词",ASR:"官接耍",ASRTO:""*/
+/*ID:513,keyword:"命令词",ASR:"丝接耍",ASRTO:""*/
+/*ID:514,keyword:"命令词",ASR:"粮接耍",ASRTO:""*/
+/*ID:515,keyword:"命令词",ASR:"菌接耍",ASRTO:""*/
+/*ID:516,keyword:"命令词",ASR:"纯接耍",ASRTO:""*/
+/*ID:517,keyword:"命令词",ASR:"趣接耍",ASRTO:""*/
+/*ID:518,keyword:"命令词",ASR:"暖接耍",ASRTO:""*/
+/*ID:519,keyword:"命令词",ASR:"猛接耍",ASRTO:""*/
+/*ID:520,keyword:"命令词",ASR:"耍丝接",ASRTO:""*/
+/*ID:521,keyword:"命令词",ASR:"接丝耍",ASRTO:""*/
+/*ID:522,keyword:"命令词",ASR:"官丝耍",ASRTO:""*/
+/*ID:523,keyword:"命令词",ASR:"丝官耍",ASRTO:""*/ 
+
+/*ID:524,keyword:"命令词",ASR:"粮官耍",ASRTO:""*/
+/*ID:525,keyword:"命令词",ASR:"菌官耍",ASRTO:""*/
+/*ID:526,keyword:"命令词",ASR:"纯官耍",ASRTO:""*/
+/*ID:527,keyword:"命令词",ASR:"趣官耍",ASRTO:""*/
+/*ID:528,keyword:"命令词",ASR:"暖官耍",ASRTO:""*/
+/*ID:529,keyword:"命令词",ASR:"猛官耍",ASRTO:""*/
+/*ID:530,keyword:"命令词",ASR:"耍粮接",ASRTO:""*/
+/*ID:531,keyword:"命令词",ASR:"接粮耍",ASRTO:""*/
+/*ID:532,keyword:"命令词",ASR:"官粮耍",ASRTO:""*/
+//{ID:533,keyword:"命令词",ASR:"丝粮耍",ASRTO:"语音识别已禁用"}
+#define ID_ASRDisabled	533
+//{ID:534,keyword:"命令词",ASR:"粮丝耍",ASRTO:"主控已上线"}
+#define ID_MCUOnline	534
+//{ID:535,keyword:"命令词",ASR:"菌丝耍",ASRTO:"主控已离线"}
+#define ID_MCUOffline	535
+//{ID:536,keyword:"命令词",ASR:"纯丝耍",ASRTO:"操作成功"} 
+#define ID_Success	536
+//{ID:537,keyword:"命令词",ASR:"趣丝耍",ASRTO:"操作失败"} 
+#define ID_Fail		537
+//{ID:538,keyword:"命令词",ASR:"暖丝耍",ASRTO:"操作失败，设备已离线"} 
+#define ID_DevOffline	538
+//{ID:539,keyword:"命令词",ASR:"猛丝耍",ASRTO:"操作失败，未找到设备"} 
+#define ID_DevNotFound	539
+
+//{ID:540,keyword:"命令词",ASR:"耍菌接",ASRTO:"忽略无法识别的指令"}
+#define ID_IgnoreUnknow 540
+//{ID:541,keyword:"命令词",ASR:"接菌耍",ASRTO:"忽略过长指令"} 
+#define ID_IgnoreOver 541
+//{ID:542,keyword:"命令词",ASR:"官菌耍",ASRTO:"系统内部错误"}
+#define ID_SystemError 542
+//{ID:543,keyword:"命令词",ASR:"丝菌耍",ASRTO:"错误，未与主控建立连接"}
+#define ID_NotReady  543
+//{ID:544,keyword:"命令词",ASR:"粮菌耍",ASRTO:"好的"}
+#define ID_OK	544
+
+enum voice_index{
+	VI_FanTurnOn,
+	VI_FanTurnOff,
+	VI_LightTurnOn,
+	VI_LightTurnOff,
+	VI_BrightnessTurnUp,
+	VI_BrightnessTurnDown,
+	VI_BrightnessMax,
+	VI_BrightnessMiddle,
+	VI_BrightnessMin,
+	VI_SpeakerTurnOn,
+	VI_SpeakerTurnOff,
+	VI_SpeakerPlay,
+	VI_SpeakerStop,
+	VI_SpeakerPause,
+	VI_SpeakerPrevious,
+	VI_SpeakerNext,
+	VI_VolumeTurnUp,
+	VI_VolumeTurnDown,
+	VI_VolumeMax,
+	VI_VolumeMiddle,
+	VI_VolumeMin,
+	VI_ResetMCU,
+	VI_ResetLight,
+	VI_ResetSensor,
+	VI_ASRVolumeUp,
+	VI_ASRVolumeDown,
+	VI_ASRVolumeMax,
+	VI_ASRVolumeMiddle,
+	VI_ASRVolumeMin,
+	VI_ASRVolumeSet,
+	VI_Enable,
+	VI_Disable,
+	VI_DebugOn,
+	VI_DebugOff,
+	VI_Success,
+	VI_Fail,
+	VI_MCUOnline,
+	VI_MCUOffline,
+	VI_DevOffline,
+	VI_DevNotFound,
+	VI_IgnoreUnknow,
+	VI_IgnoreOver,
+	
+	VI_NotReady,
+	VI_SystemError,
+};
+struct voice_index2info{
+  uint16_t flags;	//valid when online
+    #define FLAGS_VOICE_WITH_OK		(1<<0)	//Play audio with ID_OK
+    #define FLAGS_DEPEND_MCUONLINE	(1<<1)	//This command valid only if MCU online
+    #define FLAGS_GENERATOR		(1<<2)	//use "generator" to generate "info"
+  uint16_t voice_id;
+  union{
+    const char * info;
+    void (*generator)(String &);
+  };
+};
+const struct voice_index2info voices[] = {
+	[VI_FanTurnOn] = {
+	  .flags = FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_FanTurnOn,
+	  .info = "FanTurnOn",
+	},
+	[VI_FanTurnOff] = {
+	  .flags = FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_FanTurnOff,
+	  .info = "FanTurnOff",
+	},
+	[VI_LightTurnOn] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_LightTurnOn,
+	  .info = "LightTurnOn",
+	},
+	[VI_LightTurnOff] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_LightTurnOff,
+	  .info = "LightTurnOff",
+	},
+	[VI_BrightnessTurnUp] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_BrightnessTurnUp,
+	  .info = "BrightnessTurnUp",
+	},
+	[VI_BrightnessTurnDown] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_BrightnessTurnDown,
+	  .info = "BrightnessTurnDown",
+	},
+	[VI_BrightnessMax] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_BrightnessMax,
+	  .info = "BrightnessMax",
+	},
+	[VI_BrightnessMiddle] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_BrightnessMiddle,
+	  .info = "BrightnessMiddle",
+	},
+	[VI_BrightnessMin] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_BrightnessMin,
+	  .info = "BrightnessMin",
+	},
+	[VI_SpeakerTurnOn] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_SpeakerTurnOn,
+	  .info = "SpeakerTurnOn",
+	},
+	[VI_SpeakerTurnOff] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_SpeakerTurnOff,
+	  .info = "SpeakerTurnOff",
+	},
+	[VI_SpeakerPlay] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_SpeakerPlay,
+	  .info = "SpeakerPlay",
+	},
+	[VI_SpeakerStop] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_SpeakerStop,
+	  .info = "SpeakerStop",
+	},
+	[VI_SpeakerPause] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_SpeakerPause,
+	  .info = "SpeakerPause",
+	},
+	[VI_SpeakerPrevious] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_SpeakerPrevious,
+	  .info = "SpeakerPrevious",
+	},
+	[VI_SpeakerNext] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_SpeakerNext,
+	  .info = "SpeakerNext",
+	},
+	[VI_VolumeTurnUp] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_VolumeTurnUp,
+	  .info = "VolumeTurnUp",
+	},
+	[VI_VolumeTurnDown] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_VolumeTurnDown,
+	  .info = "VolumeTurnDown",
+	},
+	[VI_VolumeMax] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_VolumeMax,
+	  .info = "VolumeMax",
+	},
+	[VI_VolumeMiddle] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_VolumeMiddle,
+	  .info = "VolumeMiddle",
+	},
+	[VI_VolumeMin] = {
+	  .flags = FLAGS_VOICE_WITH_OK|FLAGS_DEPEND_MCUONLINE,
+	  .voice_id = ID_VolumeMin,
+	  .info = "VolumeMin",
+	},
+	[VI_ResetMCU] = {
+	  .flags = FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ResetMCU,
+	  .info = "ResetMCU",
+	},
+	[VI_ResetLight] = {
+	  .flags = FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ResetLight,
+	  .info = "ResetLight",
+	},
+	[VI_ResetSensor] = {
+	  .flags = FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ResetSensor,
+	  .info = "ResetSensor",
+	},
+	[VI_ASRVolumeUp] = {
+	  .flags = FLAGS_GENERATOR|FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ASRVolumeTurnUp,
+	  .generator = ASR_volume_info_generator,
+	},
+	[VI_ASRVolumeDown] = {
+	  .flags = FLAGS_GENERATOR|FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ASRVolumeTurnDown,
+	  .generator = ASR_volume_info_generator,
+	},
+	[VI_ASRVolumeMax] = {
+	  .flags = FLAGS_GENERATOR|FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ASRVolumeMax,
+	  .generator = ASR_volume_info_generator,
+	},
+	[VI_ASRVolumeMiddle] = {
+	  .flags = FLAGS_GENERATOR|FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ASRVolumeMiddle,
+	  .generator = ASR_volume_info_generator,
+	},
+	[VI_ASRVolumeMin] = {
+	  .flags = FLAGS_GENERATOR|FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ASRVolumeMin,
+	  .generator = ASR_volume_info_generator,
+	},
+	[VI_ASRVolumeSet] = {
+	  .flags = FLAGS_GENERATOR,
+	  .voice_id = ID_OK,
+	  .generator = ASR_volume_info_generator,
+	},
+
+	[VI_Enable] = {
+	  .flags = FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ASR_Enable,
+	  .info = "Enable",
+	},
+	[VI_Disable] = {
+	  .flags = FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ASR_Disable,
+	  .info = "Disable",
+	},
+	[VI_DebugOn] = {
+	  .flags = FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ASR_DebugOn,
+	  .info = "DebugOn",
+	},
+	[VI_DebugOff] = {
+	  .flags = FLAGS_VOICE_WITH_OK,
+	  .voice_id = ID_ASR_DebugOff,
+	  .info = "DebugOff",
+	},
+	[VI_Success] = {
+	  .flags = 0,
+	  .voice_id = ID_Success,
+	  .info = "Success",
+	},
+	[VI_Fail] = {
+	  .flags = 0,
+	  .voice_id = ID_Fail,
+	  .info = "Fail",
+	},
+	[VI_MCUOnline] = {
+	  .flags = 0,
+	  .voice_id = ID_MCUOnline,
+	  .info = "MCUOnline",
+	},
+	[VI_MCUOffline] = {
+	  .flags = 0,
+	  .voice_id = ID_MCUOffline,
+	  .info = "MCUOffline",
+	},
+	[VI_DevOffline] = {
+	  .flags = 0,
+	  .voice_id = ID_DevOffline,
+	  .info = "DevOffline",
+	},
+	[VI_DevNotFound] = {
+	  .flags = 0,
+	  .voice_id = ID_DevNotFound,
+	  .info = "DevNotFound",
+	},
+	[VI_IgnoreUnknow] = {
+	  .flags = 0,
+	  .voice_id = ID_IgnoreUnknow,
+	  .info = "IgnoreUnknow",
+	},
+	[VI_IgnoreOver] = {
+	  .flags = 0,
+	  .voice_id = ID_IgnoreOver,
+	  .info = "IgnoreOver",
+	},
+	
+	[VI_NotReady] = {
+	  .flags = 0,
+	  .voice_id = ID_NotReady,
+	  .info = "Waiting",
+	},
+	[VI_SystemError] = {
+	  .flags = 0,
+	  .voice_id = ID_SystemError,
+	  .info = "SystemError",
+	},
+};
+
+static inline
+void Play(int id)
+{
+	//enter_wakeup(2000);
+	play_audio(id);
+	//exit_wakeup_deal(0);
+}
+
+/*描述该功能...
+*/
+void Report(enum voice_index index, bool serial, bool voice){
+  if (index >= ARRAY_SIZE(voices)){
+    index = VI_SystemError;
+    serial = 1;
+    voice = 1;
+  }
+
+  if ((serial) && (NULL != voices[index].info))
+  {
+    if (FLAGS_GENERATOR & voices[index].flags){
+      String info = "";
+      voices[index].generator(info);
+      Serial.println(info);
+    }else
+      Serial.println(voices[index].info);
+  }
+    
+  if ((voices[index].flags & FLAGS_DEPEND_MCUONLINE) && (!MCUOnline)){
+    index = VI_MCUOffline;
+  }
+  if ((voice) && (0 != voices[index].voice_id))
+  {
+    if(voices[index].flags & FLAGS_VOICE_WITH_OK)
+      Play(ID_OK);
+    Play(voices[index].voice_id);
+  }
+}
+
+void reset_controller(){
+  Ready = 0;
+  pinMode(PIN_RESET,output);
+  pinMode(PIN_RESET,output);
+  digitalWrite(PIN_RESET,0);
+  delay(10);
+  pinMode(PIN_RESET,input);
+  dpmu_set_io_pull(pinToFun[PIN_RESET],DPMU_IO_PULL_UP);
+}
+
+static
+void _ASR_volume_set(int32_t volume){
+  if (volume > ASRPRO_VOLUME_MAX)
+    volume = ASRPRO_VOLUME_MAX;
+  if (volume < ASRPRO_VOLUME_MIN)
+    volume = ASRPRO_VOLUME_MIN;
+  ASR_volume = volume;
+  vol_set(ASR_volume);
+}
+
+static
+void weather_set(weather_t *weather, String cmd)
+{
+  char tmp[2*16];
+	weather->weather = "";
+	weather->weather2 = "";
+	weather->min = -300;
+	weather->max = -300;
+	weather->current = -300;
+	weather->indoor = -300;
+
+  sscanf(cmd.c_str(), "%d,%d,%d,%d@%s", 
+			&weather->min, 
+			&weather->max, 
+			&weather->current, 
+			&weather->indoor,
+			tmp);
+	char *colon = strchr(tmp, ':');
+	if (NULL != colon)
+	{
+	    colon[0] = '\0';
+	    colon++;
+	}
+	weather->weather = tmp;
+	weather->weather2 = colon;
+}
+static
+int weather2id(String weather)
+{
+	int id;
+	if (NULL == weather)
+		return ID_WEATHER_ERROR;
+	if (weather == "sunny")
+		id = ID_WEATHER_SUNNY;
+	else if(weather == "partycloudy")
+		id = ID_WEATHER_PARTYCLOUDY;
+	else if(weather == "cloudy")
+		id = ID_WEATHER_CLOUDY;
+	else if(weather == "rainy")
+		id = ID_WEATHER_RAINY;
+	else if(weather == "snowy")
+		id = ID_WEATHER_SNOWY;
+	else
+		id = ID_WEATHER_ERROR;
+	return id;
+}
+static
+void weather_play_temperature(int temp)
+{
+	play_num((int64_t)(temp*100), 1);
+	Play(ID_WEATHER_DEGREE);
+}
+static
+void weather_play(weather_t *weather)
+{
+	int id = weather2id(weather->weather);
+	Play(id);
+	if (ID_WEATHER_ERROR == id)
+		return;
+	id = weather2id(weather->weather2);
+	if (ID_WEATHER_ERROR != id)
+	{
+		Play(ID_WEATHER_CHANGETO);
+		Play(id);
+	}
+	Play(ID_WEATHER_TEMPERATURE);
+	weather_play_temperature(weather->min);
+	Play(ID_WEATHER_TO);
+	weather_play_temperature(weather->max);
+
+	Play(ID_WEATHER_OUTDOOR);
+	weather_play_temperature(weather->current);
+	if (weather->indoor > -200)
+	{
+		Play(ID_WEATHER_INDOOR);
+		weather_play_temperature(weather->indoor);
+	}
+}
+
+/*描述该功能...
+*/
+void asr_process(uint16_t id2){
+  if(id2 <= SR_ASR_Enable){
+    Enable = 1;
+    vol_set(ASR_volume);
+    Report(VI_Enable, 1, 1);
+  }
+  else if(id2 <= SR_ASR_Disable){
+    Enable = 0;
+    Report(VI_Disable, 1, 1);
+  }
+}
+
+void local_process(uint16_t id2){
+  if (id2 == SR_ASR_DebugOn){
+    Debug = 1;
+    Report(VI_DebugOn, 1, 1);
+  }else if (id2 == SR_ASR_DebugOff){
+    Debug = 0;
+    Report(VI_DebugOff, 1, 1);
+  }else if(id2 == SR_MAIN_ResetMCU){
+    reset_controller();
+    Report(VI_ResetMCU, 0, 1);
+  }else if(id2 <= SR_ASR_volumeTurnUp){
+    _ASR_volume_set(ASR_volume+1);
+    Report(VI_ASRVolumeUp, 1, 1);
+  }else if (id2 <= SR_ASR_volumeTurnDown){
+    _ASR_volume_set(ASR_volume-1);
+    Report(VI_ASRVolumeDown, 1, 1);
+  }else if (id2 == SR_ASR_volumeMax){
+    _ASR_volume_set(ASRPRO_VOLUME_MAX);  	
+    Report(VI_ASRVolumeMax, 1, 1);
+  }else if (id2 == SR_ASR_volumeMin){
+    _ASR_volume_set(ASRPRO_VOLUME_MIN);  	
+    Report(VI_ASRVolumeMin, 1, 1);
+  }else if (id2 == SR_ASR_volumeMiddle){
+    _ASR_volume_set((ASRPRO_VOLUME_MAX+ASRPRO_VOLUME_MIN)/2);  	
+    Report(VI_ASRVolumeMiddle, 1, 1);
+  }
+}
+
+/*描述该功能...
+*/
+void reset_process(uint16_t id2){
+  if(id2 <= SR_RESET_Light){
+    Report(VI_ResetLight, 1, 0);
+    if (light_exist)
+      Report(VI_ResetLight, 0, 1);
+    else if (Debug)
+      Report(VI_DevNotFound, 0, 1);
+  }else if (id2 <= SR_RESET_Sensor){
+    Report(VI_ResetSensor, 1, 1);
+  }
+}
+
+/*描述该功能...
+*/
+void fan_process(uint16_t id2){
+  if(id2 <= SR_FAN_TurnOn){
+    Report(VI_FanTurnOn, 1, 1);
+  }
+  else if(id2 <= SR_FAN_TurnOff){
+    Report(VI_FanTurnOff, 1, 1);
+  }
+}
+
+/*描述该功能...
+*/
+void light_process(uint16_t id2){
+  if(id2 <= SR_LIGHT_TurnOn){
+    Report(VI_LightTurnOn, 1, 1);
+  }
+  else if(id2 <= SR_LIGHT_TurnOff){
+    Report(VI_LightTurnOff, 1, 1);
+  }
+  else if(id2 <= SR_LIGHT_BrightnessTurnUp){
+    Report(VI_BrightnessTurnUp, 1, 1);
+  }
+  else if(id2 <= SR_LIGHT_BrightnessTurnDown){
+    Report(VI_BrightnessTurnDown, 1, 1);
+  }
+  else if(id2 <= SR_LIGHT_BrightnessMax){
+    Report(VI_BrightnessMax, 1, 1);
+  }
+  else if(id2 <= SR_LIGHT_BrightnessMiddle){
+    Report(VI_BrightnessMiddle, 1, 1);
+  }
+  else if(id2 <= SR_LIGHT_BrightnessMin){
+    Report(VI_BrightnessMin, 1, 1);
+  }
+}
+
+/*描述该功能...
+*/
+void speaker_process(uint16_t id2){
+  switch(id2){
+    case SR_SPEAKER_TurnOn:
+      Report(VI_SpeakerTurnOn, 1, 1);
+    break;
+    case SR_SPEAKER_TurnOff:
+      Report(VI_SpeakerTurnOff, 1, 1);
+    break;
+    case SR_SPEAKER_Play:
+      Report(VI_SpeakerPlay, 1, 1);
+    break;
+    case SR_SPEAKER_Stop:
+      Report(VI_SpeakerStop, 1, 1);
+    break;
+    case SR_SPEAKER_Pause:
+      Report(VI_SpeakerPause, 1, 1);
+    break;
+    case SR_SPEAKER_Previous:
+      Report(VI_SpeakerPrevious, 1, 1);
+    break;
+    case SR_SPEAKER_Next:
+      Report(VI_SpeakerNext, 1, 1);
+    break;
+    default:	//volume
+	  if(id2 <= SR_SPEAKER_VolumeTurnUp){
+	    Report(VI_VolumeTurnUp, 1, 1);
+	  }
+	  else if(id2 <= SR_SPEAKER_VolumeTurnDown){
+	    Report(VI_VolumeTurnDown, 1, 1);
+	  }
+	  else if(id2 <= SR_SPEAKER_VolumeMax){
+	    Report(VI_VolumeMax, 1, 1);
+	  }
+	  else if(id2 <= SR_SPEAKER_VolumeMiddle){
+	    Report(VI_VolumeMiddle, 1, 1);
+	  }
+	  else if(id2 <= SR_SPEAKER_VolumeMin){
+	    Report(VI_VolumeMin, 1, 1);
+	  }
+    break;
+  }
+}
+
+void weather_process(uint16_t id2)
+{
+  if(id2 <= SR_WEATHER_TODAY){
+	    Play(ID_WEATHER_TODAY);
+    	weather_play(&today);
+  }
+  else if(id2 <= SR_WEATHER_TOMORROW){
+	    Play(ID_WEATHER_TOMORROW);
+    	weather_play(&tomorrow);
+  }else
+      return;
+}
+
+void uart_cmd_process(void)
+{
+  if (uart_cmd == "Pong"){
+    ping_count = 0;
+  }else if (uart_cmd == "Ping"){
+    Serial.println("Pong");
+  }else if(uart_cmd == "Enable"){
+    Enable = 1;
+    if (Debug)
+    	Report(VI_Enable, 0, 1);
+  }
+  else if(uart_cmd == "Disable"){
+    Enable = 0;
+    if (Debug)
+    	Report(VI_Disable, 0, 1);
+  }
+  else if(uart_cmd == "State"){
+    if (Enable)
+      Report(VI_Enable, 1, 0);
+    else
+      Report(VI_Disable, 1, 0);
+    Report(VI_ASRVolumeSet, 1, 0);
+    if (Debug)
+    	Report(VI_DebugOn, 1, 0);
+    else
+    	Report(VI_DebugOff, 1, 0);
+  }
+  else if(uart_cmd == "Success"){
+    Report(VI_Success, 0, 1);
+  }
+  else if(uart_cmd == "Fail"){
+    Report(VI_Fail, 0, 1);
+  }
+  else if(uart_cmd == "MCUOffline"){
+    MCUOnline = 0;
+    if (Debug)
+    	Report(VI_MCUOffline, 0, 1);
+  }
+  else if(uart_cmd == "MCUOnline"){
+    MCUOnline = 1;
+    if (Debug)
+    	Report(VI_MCUOnline, 0, 1);
+  }
+  else if(uart_cmd == "DevOffline"){
+    Report(VI_DevOffline, 0, 1);
+  }
+  else if(uart_cmd == "LightExist"){
+    light_exist = 1;
+  }
+  else if(uart_cmd == "LightNotExist"){
+    light_exist = 0;
+  }
+  else if(uart_cmd == "LightOnline"){
+    light_online = 1;
+  }
+  else if(uart_cmd == "LightOffline"){
+    light_online = 0;
+  }
+  else if(uart_cmd == "SpeakerExist"){
+    speaker_exist = 1;
+  }
+  else if(uart_cmd == "SpeakerNotExist"){
+    speaker_exist = 0;
+  }
+  else if(uart_cmd == "SpeakerOnline"){
+    speaker_online = 1;
+  }
+  else if(uart_cmd == "SpeakerOffline"){
+    speaker_online = 0;
+  }
+  else if(uart_cmd == "Ready"){
+    Ready = 1;
+    ping_count = 0;
+  }else if (uart_cmd == "PrintEnv"){
+    print_env();
+  }else if (uart_cmd == "DebugOn"){
+    Debug = 1;
+    Report(VI_DebugOn, 0, 1);
+  }else if (uart_cmd == "DebugOff"){
+    Debug = 0;
+  }else if (!strncmp(uart_cmd.c_str(), "ASRVolume:", 10))
+  {
+    uart_cmd.remove(0, 10);
+    _ASR_volume_set(uart_cmd.toInt());
+  }else if (!strncmp(uart_cmd.c_str(), "Today:", 6)){
+    uart_cmd.remove(0, 6);
+    weather_set(&today, uart_cmd);
+  }else if (!strncmp(uart_cmd.c_str(), "Tomorrow:", 9)){
+    uart_cmd.remove(0, 9);
+    weather_set(&tomorrow, uart_cmd);
+  }else if (!strncmp(uart_cmd.c_str(), "Weather:", 8)){
+    uart_cmd.remove(0, 8);
+    if (uart_cmd == "Today"){
+	    Play(ID_WEATHER_TODAY);
+    	weather_play(&today);
+    }else if (uart_cmd == "Tomorrow"){
+	    Play(ID_WEATHER_TOMORROW);
+    	weather_play(&tomorrow);
+    }
+  }else{
+    if(uart_cmd != ""){
+      Serial.print("Unknow cmd:");
+      Serial.println(uart_cmd);
+      if (Ready && Debug)
+        Report(VI_IgnoreUnknow, 0, 1);
+    }
+  }
+}
+
+/*描述该功能...
+*/
+bool uart_recv(){
+  bool ret = 0;
+  uint8_t data = Serial.read();
+  switch (data) {
+   case 0x0a:
+    _nop_();
+    break;
+   case 0x0d:
+    ret = 1;
+    break;
+   default:
+    char buf = data;
+    uart_cmd = uart_cmd + buf;
+    break;
+  }
+  return ret;
+}
+
+void TIM_attachInterrupt_0() {
+  timer_count++;
+  if (!Ready){
+    digitalWrite(PIN_LED, timer_count & 1);
+    if (0 == (timer_count & 3))
+      Report(VI_NotReady, 1, 0);
+    return;
+  }
+  if (!MCUOnline){
+    if (0 == (timer_count & 3))
+      digitalWrite(PIN_LED, (timer_count>>2) & 1);
+    return;
+  }
+  //Normal mode
+  if (0 == (timer_count & 0xf))
+    digitalWrite(PIN_LED, 0);
+  else
+    digitalWrite(PIN_LED, 1);
+}
+
+static inline
+void ping_process(){
+    if ((timer_count & PING_PERIOD_COUNT) != 0)
+    {
+        ping_count |= 1;
+        return;
+    }
+    /*Check if the "ping" command has been sent in this period*/
+    if (0 == (1 & ping_count))	
+    	return;
+    ping_count++;
+    if (ping_count >= (PING_RESET_MCU << 1)){
+        /*Too many ping fail, reset controller*/
+        reset_controller();
+        Play(ID_MCUOffline);
+        Play(ID_ResetMCU);
+        ping_count = 0;
+        return;
+    }
+    if (!Ready)
+        return;
+    Serial.println("Ping");
+    if (ping_count >= (PING_LOST_CONNECT<<1))
+       Ready = 0;
+}
+
+void app_uart_recv(){
+#ifdef DEBUG
+  uint32_t debug_count = 0;
+#endif	//DEBUG
+  
+  while (1) {
+    while (!(Serial.available() > 0)) {
+      ping_process();
+      delay(3);
+#ifdef DEBUG
+      if (!Ready)
+      {
+ 	if (timer_count-debug_count >= 1000)
+   	{
+    		Serial.print(">>>>>>NotReady!<<<<<<\r\n");
+    		print_uart();
+    		print_cmd();
+    		print_env();
+    		debug_count = timer_count;
+    	}
+      }else
+ 	debug_count = timer_count;
+#endif	//DEBUG
+    }//while (!(Serial.available() > 0))
+    if(uart_recv()){
+      uart_cmd_process();
+      uart_cmd = "";
+    }else{
+      if(uart_cmd.length() > UART_CMD_MAX_LENGTH){
+        if (Ready && Debug)
+          Report(VI_IgnoreOver, 0, 1);
+        uart_cmd = "";
+        Serial.flush();
+      }
+    }//if(uart_recv())
+  }//while (1)
+  vTaskDelete(NULL);
+}
+
+ 
+void ASR_CODE()
+{
+  static uint32_t tick = 0;
+  Serial.print("SNID:");
+  Serial.println(snid);
+  
+  if (0 == snid)
+  {//wakeup
+    tick = timer_count;
+    //set_state_enter_wakeup(2500);
+    return;
+  }else
+  {//command, check if wakeup timeout
+  	uint32_t interval = timer_count-tick;
+  	tick = timer_count - 5 * 1000/TIMER_PERIOD - 2;
+	if (interval > (5*1000/TIMER_PERIOD))
+		return;
+  }
+  //exit_wakeup_deal(0);
+  
+  if(SNID_IS_ENABLE_ID(snid)){
+    asr_process(snid);
+    return;
+  }
+  if (!Enable)
+  {
+  	Play(ID_ASRDisabled);
+  	return;
+  }
+  if (SNID_IS_LOCAL_ID(snid)){
+    local_process(snid);
+    return;
+  }
+  
+  if (!Ready){
+    Report(VI_NotReady, 0, 1);
+    return;
+  }
+  if(SNID_IS_RESET_ID(snid)){
+    reset_process(snid);
+  }else if(SNID_IS_FAN_ID(snid)){
+    fan_process(snid);
+  }else if(SNID_IS_LIGHT_ID(snid)){
+    if (light_exist){
+      if (light_online)
+        light_process(snid);
+      else
+        Report(VI_DevOffline, 0, 1);
+    }
+    else if (Debug){
+      Report(VI_DevNotFound, 0, 1);
+    }
+  }else if (SNID_IS_SPEAKER_ID(snid)){
+    if (speaker_exist)
+    {
+     	if (speaker_online){
+	  speaker_process(snid);
+     	}else
+    	  Report(VI_DevOffline, 0, 1);
+    }else if (Debug){
+    	Report(VI_DevNotFound, 0, 1);
+    }
+  }else if (SNID_IS_WEATHER_ID(snid)){
+	weather_process(snid);
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  TIM_attachInterrupt(TIMER0, TIMER_PERIOD*1000, TIM_attachInterrupt_0);
+  
+  setPinFun(PIN_LED,FIRST_FUNCTION);
+  setPinFun(PIN_RESET,FIRST_FUNCTION);
+  pinMode(PIN_LED,output);
+  pinMode(PIN_RESET,input);
+  digitalWrite(PIN_LED,0);
+  dpmu_set_io_pull(pinToFun[PIN_RESET],DPMU_IO_PULL_UP);
+
+  set_wakeup_forever();
+  /*set_state_enter_wakeup(2500);*/
+  Serial.flush();
+  setPinFun(13,SECOND_FUNCTION);
+  setPinFun(14,SECOND_FUNCTION);
+  
+  TIM_Enable(TIMER0);
+  xTaskCreate(app_uart_recv,"app_uart_recv",256+64,NULL,3,NULL);
+}
+
+
+
+
+
+
+/** edittype="asr_procode" */
